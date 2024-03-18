@@ -68,28 +68,6 @@ pub struct MessageQueue<T> {
     initialized: bool,
     types: PhantomData<T>,
 }
-#[repr(C)]
-pub struct Message {
-    /// This should be a positive integer.
-    /// For normal usage, it is inconsequential,
-    /// but you may want to use it for filtering.
-    ///
-    /// In fact, if you are looking for messages
-    /// with a specific type, the `msgtyp` parameter
-    /// of [`msgrcv()`] might be of use to you.
-    ///
-    /// Check out its documentation for more info.
-    pub mtype: i64,
-    /// This is a simple byte array. The 'standard'
-    /// allows for mtext to be either a structure
-    /// or an array. For the purposes of `ipc-rs`,
-    /// array is the better choice.
-    ///
-    /// Currently, the data is stored as CBOR, the
-    /// more efficient byte JSON. Check out the
-    /// documentation of `serde_cbor`.
-    pub mtext: [u8; 65536],
-}
 impl<T> MessageQueue<T> {
     /// Allow the creation of a new message queue
     pub fn create(mut self) -> Self {
@@ -198,12 +176,9 @@ where
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let message: Box<Message> = Box::new(Message {
-            mtype: 0,
-            mtext: [0; 65536],
-        });
+        let mtext = [0; 65536];
         let size = 0;
-        match serde_cbor::from_slice(&message.mtext[..size as usize]) {
+        match serde_cbor::from_slice(&mtext[..size as usize]) {
             Ok(r) => Ok(r),
             Err(_) => Err(IpcError::FailedToDeserialize),
         }
@@ -217,13 +192,10 @@ where
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let message: Box<Message> = Box::new(Message {
-            mtype: 0,
-            mtext: [0; 65536],
-        }); // spooky scary stuff
+        let mtext = [0; 65536];
 
         let size = 0;
-        match serde_cbor::from_slice(&message.mtext[..size as usize]) {
+        match serde_cbor::from_slice(&mtext[..size as usize]) {
             Ok(r) => Ok(r),
             Err(_) => Err(IpcError::FailedToDeserialize),
         }

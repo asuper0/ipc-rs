@@ -1,7 +1,5 @@
 //! Module containing raw definitions mapping to the underlying IPC protocol
 
-use Message;
-
 use libc::{
     size_t, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, MSG_COPY,
     MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT,
@@ -27,7 +25,7 @@ extern "C" {
     ///    will be either truncated (MSG_NOERROR flag) or the function will
     ///    fail and set `errno` to `E2BIG` (default behavior)
     /// * `msgflg` - flags, see [`IpcFlags`] for more info
-    pub fn msgsnd(msqid: c_int, msgp: *const Message, msgsz: size_t, msgflg: c_int) -> c_int;
+    pub fn msgsnd(msqid: c_int, msgp: *const u8, msgsz: size_t, msgflg: c_int) -> c_int;
 
     /// Raw `msgrcv()` function; see [`msgsnd()`] for more details on usage
     ///
@@ -44,7 +42,7 @@ extern "C" {
     /// * `msgflg` - flags, see [`IpcFlags`] for more info
     pub fn msgrcv(
         msqid: c_int,
-        msgp: *mut Message,
+        msgp: *mut u8,
         msgsz: size_t,
         msgtyp: c_long,
         msgflg: c_int,

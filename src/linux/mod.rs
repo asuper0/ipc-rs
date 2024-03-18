@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 use libc::{msgctl, msgget, msqid_ds};
 
 use std::ptr;
-//use std::mem;
-use std::borrow::{Borrow, BorrowMut};
-use std::convert::From;
 use std::marker::PhantomData;
 
 pub mod raw;
@@ -20,13 +17,36 @@ use raw::*;
 
 use crate::{IpcError, Mode};
 
+const MSG_TYPE_FIELD_LEN: usize = 8;
+
+impl From<Errno> for IpcError {
+    fn from(value: Errno) -> Self {
+        match value {
+            Errno::EFAULT => IpcError::CouldntReadMessage,
+            Errno::EIDRM => IpcError::QueueWasRemoved,
+            Errno::EINTR => IpcError::SignalReceived,
+            Errno::EINVAL => IpcError::InvalidMessage,
+            Errno::E2BIG => IpcError::MessageTooBig,
+            Errno::EPERM => IpcError::AccessDenied,
+            Errno::EACCES => IpcError::AccessDenied,
+            Errno::ENOMSG => IpcError::NoMessage,
+            Errno::EAGAIN => IpcError::QueueFull,
+            Errno::ENOMEM => IpcError::NoMemory,
+            Errno::EEXIST => IpcError::QueueAlreadyExists,
+            Errno::ENOENT => IpcError::QueueDoesntExist,
+            Errno::ENOSPC => IpcError::TooManyQueues,
+            _ => IpcError::UnknownErrorValue(errno()),
+        }
+    }
+}
+
 /// The main message queue type.
 /// It holds basic information about a given message queue
 /// as well as type data about the content that passes
 /// through it.
 ///
 /// The `PhantomData` marker ensures that the queue
-/// is locked to (de)serializing a single tyoe.
+/// is locked to (de)serializing a single type.
 ///
 /// MessageQueue is quite liberal about the types
 /// it accepts. If you are only ever going to send
@@ -57,7 +77,7 @@ use crate::{IpcError, Mode};
 ///
 /// # fn main() -> Result<(), IpcError> {
 /// let my_key = 1234;
-/// let queue = MessageQueue::<String>::new(my_key)
+/// let queue = MessageQueue::<String>::new(my_key, 128)
 /// 	.create()
 /// 	.async()
 /// 	.init()?;
@@ -75,7 +95,7 @@ pub struct MessageQueue<T> {
     /// This is the key that was given when the
     /// `MessageQueue` was created, make sure to use
     /// the same key on both sides of the barricade
-    /// to ensure proper 'connection' is estabilised
+    /// to ensure proper 'connection' is established
     pub key: i32,
     /// The bit flags used to create a new queue,
     /// see [`IpcFlags`] for more info.
@@ -109,57 +129,8 @@ pub struct MessageQueue<T> {
     pub mode: i32,
     auto_kill: bool,
     initialized: bool,
+    max_size: usize,
     types: PhantomData<T>,
-}
-
-/// This struct represents a message that is inserted into
-/// a message queue on every [`MessageQueue::send()`] call.
-///
-/// It follows the SysV message recipe of having only two
-/// fields, namely:
-///
-/// * `mtype: i64` - which is the type of a message, it can
-///   be used for filtering within queues and should never
-///   be a negative integer. u64 isn't used here, however,
-///   because of the kernel's anticipated internal representation
-/// * `mtext` - which is where the data of the message are stored.
-///   The kernel doesn't care about what `mtext` is so long
-///   as it is not a pointer (because pointers are a recipe
-///   for trouble when passing the interprocess boundary).
-///   Therefore it can be either a struct or an array. Here,
-///   an array of 8K bytes was chosen to allow the maximum
-///   versatility within the default message size limit (8KiB).
-///   In the future, functionality to affect the limit shall
-///   be exposed and bigger messages will be allowed
-///
-/// Messages are required to be #[repr(C)] to avoid unexpected
-/// surprises.
-///
-/// Finally, due to the size of a Message, it is unwise to
-/// store them on the stack. On Arch x86_64, the default stack
-/// size is 8mb, which is just enough for less than a thousand
-/// messages. Use Box instead.
-#[repr(C)]
-pub struct Message {
-    /// This should be a positive integer.
-    /// For normal usage, it is inconsequential,
-    /// but you may want to use it for filtering.
-    ///
-    /// In fact, if you are looking for messages
-    /// with a specific type, the `msgtyp` parameter
-    /// of [`msgrcv()`] might be of use to you.
-    ///
-    /// Check out its documentation for more info.
-    pub mtype: i64,
-    /// This is a simple byte array. The 'standard'
-    /// allows for mtext to be either a structure
-    /// or an array. For the purposes of `ipc-rs`,
-    /// array is the better choice.
-    ///
-    /// Currently, the data is stored as CBOR, the
-    /// more efficient byte JSON. Check out the
-    /// documentation of `serde_cbor`.
-    pub mtext: [u8; 65536],
 }
 
 impl<T> Drop for MessageQueue<T> {
@@ -228,14 +199,15 @@ impl<T> MessageQueue<T> {
         };
 
         match res {
-            -1 => match Errno::from_i32(errno()) {
-                Errno::EPERM => Err(IpcError::AccessDenied),
-                Errno::EACCES => Err(IpcError::AccessDenied),
-                Errno::EFAULT => Err(IpcError::InvalidStruct),
-                Errno::EINVAL => Err(IpcError::InvalidCommand),
-                Errno::EIDRM => Err(IpcError::QueueDoesntExist),
-                _ => Err(IpcError::UnknownErrorValue(errno())),
-            },
+            -1 => {
+                let err = Errno::from_i32(errno());
+                match err {
+                    Errno::EFAULT => Err(IpcError::InvalidStruct),
+                    Errno::EINVAL => Err(IpcError::InvalidCommand),
+                    Errno::EIDRM => Err(IpcError::QueueDoesntExist),
+                    _ => Err(err.into()),
+                }
+            }
             _ => {
                 self.initialized = false;
                 Ok(())
@@ -250,14 +222,7 @@ impl<T> MessageQueue<T> {
         self.id = unsafe { msgget(self.key, self.mask | self.mode) };
 
         match self.id {
-            -1 => match Errno::from_i32(errno()) {
-                Errno::EEXIST => Err(IpcError::QueueAlreadyExists),
-                Errno::ENOENT => Err(IpcError::QueueDoesntExist),
-                Errno::ENOSPC => Err(IpcError::TooManyQueues),
-                Errno::EACCES => Err(IpcError::AccessDenied),
-                Errno::ENOMEM => Err(IpcError::NoMemory),
-                _ => Err(IpcError::UnknownErrorValue(errno())),
-            },
+            -1 => Err(Errno::from_i32(errno()).into()),
             _ => Ok(self),
         }
     }
@@ -266,7 +231,7 @@ impl<T> MessageQueue<T> {
     /// In the future, it will be possible to use more types
     /// of keys (which would be translated to i32 behind the
     /// scenes automatically)
-    pub fn new(key: i32) -> Self {
+    pub fn new(key: i32, max_size: usize) -> Self {
         MessageQueue {
             id: -1,
             key,
@@ -276,6 +241,7 @@ impl<T> MessageQueue<T> {
             initialized: false,
             auto_kill: false,
             types: PhantomData,
+            max_size: max_size + MSG_TYPE_FIELD_LEN,
         }
     }
 }
@@ -294,35 +260,24 @@ where
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let mut message = Box::new(Message {
-            mtype: mtype.into(),
-            mtext: [0; 65536],
-        });
-        let bytes = match serde_cbor::ser::to_vec(&src) {
-            Ok(b) => b,
-            Err(_) => return Err(IpcError::FailedToSerialize),
+        let mut buffer: Vec<u8> = Vec::with_capacity(self.max_size);
+        let mtype: i64 = mtype.into();
+        buffer.extend(mtype.to_le_bytes());
+        if let Err(_) = serde_cbor::ser::to_writer(&mut buffer, &src) {
+             return Err(IpcError::FailedToSerialize);
+        }
+
+        let res = unsafe {
+            msgsnd(
+                self.id,
+                buffer.as_ptr(),
+                buffer.len() - MSG_TYPE_FIELD_LEN,
+                0,
+            )
         };
 
-        bytes
-            .iter()
-            .enumerate()
-            .for_each(|(i, x)| message.mtext[i] = *x);
-
-        let res = unsafe { msgsnd(self.id, message.borrow() as *const Message, bytes.len(), 0) };
-
         match res {
-            -1 => match Errno::from_i32(errno()) {
-                Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-                Errno::EIDRM => Err(IpcError::QueueWasRemoved),
-                Errno::EINTR => Err(IpcError::SignalReceived),
-                Errno::EINVAL => Err(IpcError::InvalidMessage),
-                Errno::E2BIG => Err(IpcError::MessageTooBig),
-                Errno::EACCES => Err(IpcError::AccessDenied),
-                Errno::ENOMSG => Err(IpcError::NoMessage),
-                Errno::EAGAIN => Err(IpcError::QueueFull),
-                Errno::ENOMEM => Err(IpcError::NoMemory),
-                _ => Err(IpcError::UnknownErrorValue(errno())),
-            },
+            -1 => Err(Errno::from_i32(errno()).into()),
             0 => Ok(()),
             x => Err(IpcError::UnknownReturnValue(x as i32)),
         }
@@ -336,87 +291,46 @@ where
     /// Returns a message without removing it from the message
     /// queue. Use `recv()` if you want to consume the message
     pub fn peek(&self) -> Result<T, IpcError> {
-        if !self.initialized {
-            return Err(IpcError::QueueIsUninitialized);
-        }
-
-        let mut message: Box<Message> = Box::new(Message {
-            mtype: 0,
-            mtext: [0; 65536],
-        });
-
-        let size = unsafe {
-            msgrcv(
-                self.id,
-                message.borrow_mut() as *mut Message,
-                65536,
-                0,
-                IpcFlags::MsgCopy as i32 | self.message_mask,
-            )
-        };
-
-        if size >= 0 {
-            match serde_cbor::from_slice(&message.mtext[..size as usize]) {
-                Ok(r) => Ok(r),
-                Err(_) => Err(IpcError::FailedToDeserialize),
-            }
-        } else {
-            match Errno::from_i32(errno()) {
-                Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-                Errno::EIDRM => Err(IpcError::QueueWasRemoved),
-                Errno::EINTR => Err(IpcError::SignalReceived),
-                Errno::EINVAL => Err(IpcError::InvalidMessage),
-                Errno::E2BIG => Err(IpcError::MessageTooBig),
-                Errno::EACCES => Err(IpcError::AccessDenied),
-                Errno::ENOMSG => Err(IpcError::NoMessage),
-                Errno::EAGAIN => Err(IpcError::QueueFull),
-                Errno::ENOMEM => Err(IpcError::NoMemory),
-                _ => Err(IpcError::UnknownErrorValue(errno())),
-            }
-        }
+        self.inner_recv(IpcFlags::MsgCopy as i32 | self.message_mask)
     }
 
     /// Receives a message, consuming it. If no message is
     /// to be received, `recv()` either blocks or returns
     /// [`IpcError::NoMemory`]
     pub fn recv(&self) -> Result<T, IpcError> {
+        self.inner_recv(self.message_mask)
+    }
+
+    fn inner_recv(&self, msg_flag: i32) -> Result<T, IpcError> {
         if !self.initialized {
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let mut message: Box<Message> = Box::new(Message {
-            mtype: 0,
-            mtext: [0; 65536],
-        }); // spooky scary stuff
+        let mut buffer = Vec::with_capacity(self.max_size);
 
         let size = unsafe {
-            msgrcv(
+            let size = msgrcv(
                 self.id,
-                message.borrow_mut() as *mut Message,
-                65536,
+                buffer.as_mut_ptr(),
+                self.max_size,
                 0,
-                self.message_mask,
-            )
+                msg_flag,
+            );
+            if size >= 0 {
+                buffer.set_len(size as usize);
+            }
+            size
         };
 
         if size >= 0 {
-            match serde_cbor::from_slice(&message.mtext[..size as usize]) {
+            match serde_cbor::from_slice(
+                &buffer[MSG_TYPE_FIELD_LEN..MSG_TYPE_FIELD_LEN + size as usize],
+            ) {
                 Ok(r) => Ok(r),
                 Err(_) => Err(IpcError::FailedToDeserialize),
             }
         } else {
-            match Errno::from_i32(errno()) {
-                Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-                Errno::EIDRM => Err(IpcError::QueueWasRemoved),
-                Errno::EINTR => Err(IpcError::SignalReceived),
-                Errno::EINVAL => Err(IpcError::InvalidMessage),
-                Errno::E2BIG => Err(IpcError::MessageTooBig),
-                Errno::EACCES => Err(IpcError::AccessDenied),
-                Errno::ENOMSG => Err(IpcError::NoMessage),
-                Errno::EAGAIN => Err(IpcError::QueueFull),
-                Errno::ENOMEM => Err(IpcError::NoMemory),
-                _ => Err(IpcError::UnknownErrorValue(errno())),
-            }
+            Err(Errno::from_i32(errno()).into())
         }
     }
 }
@@ -428,7 +342,7 @@ mod tests {
 
     #[test]
     fn send_message() {
-        let queue = MessageQueue::new(1234).init().unwrap();
+        let queue = MessageQueue::new(1234, 128).init().unwrap();
         let res = queue.send("kalinka", 25);
         println!("{:?}", res);
         assert!(res.is_ok());
@@ -436,7 +350,7 @@ mod tests {
 
     #[test]
     fn recv_message() {
-        let queue = MessageQueue::<String>::new(1234).init().unwrap();
+        let queue = MessageQueue::<String>::new(1234, 128).init().unwrap();
         let res = queue.recv();
         println!("{:?}", res);
         assert!(res.is_ok());
@@ -444,7 +358,7 @@ mod tests {
 
     #[test]
     fn nonblocking() {
-        let queue = MessageQueue::<()>::new(745965545)
+        let queue = MessageQueue::<()>::new(745965545, 128)
             .to_async()
             .init()
             .unwrap();
