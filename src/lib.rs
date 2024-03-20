@@ -13,7 +13,6 @@ extern crate libc;
 #[cfg(unix)]
 extern crate nix;
 extern crate serde;
-extern crate serde_cbor;
 
 #[cfg(unix)]
 pub mod linux;

@@ -5,7 +5,7 @@ use libc::{
     MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT,
 };
 
-use std::os::raw::{c_int, c_long};
+use std::os::raw::{c_char, c_int, c_long};
 
 extern "C" {
     /// Raw `msgsnd()` function; we need to use this declaration as opposed to
@@ -47,6 +47,8 @@ extern "C" {
         msgtyp: c_long,
         msgflg: c_int,
     ) -> isize;
+
+    pub fn ftok(path_name: *const c_char, proj_id: c_int) -> c_int;
 }
 
 /// Bit flags for `msgget`

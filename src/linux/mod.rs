@@ -1,16 +1,13 @@
-// use serde_cbor;
-// use serde;
-// use libc;
-// use nix;
-
 use nix::errno::errno;
 use nix::errno::Errno;
 use serde::{Deserialize, Serialize};
 
 use libc::{msgctl, msgget, msqid_ds};
 
-use std::ptr;
+use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
+use std::ops::{Index, Range};
+use std::{io, ptr};
 
 pub mod raw;
 use raw::*;
@@ -37,6 +34,110 @@ impl From<Errno> for IpcError {
             Errno::ENOSPC => IpcError::TooManyQueues,
             _ => IpcError::UnknownErrorValue(errno()),
         }
+    }
+}
+
+struct Message {
+    buf: Vec<u8>,
+}
+
+impl Message {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(MSG_TYPE_FIELD_LEN + capacity),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_msg_type(&self) -> i64 {
+        debug_assert!(self.buf.len() >= MSG_TYPE_FIELD_LEN);
+
+        unsafe {
+            let ptr = self.buf.as_ptr() as *const i64;
+            *ptr
+        }
+    }
+
+    pub fn set_msg_type(&mut self, msg_type: i64) {
+        if self.buf.len() >= MSG_TYPE_FIELD_LEN {
+            let buf_ptr = self.buf.as_mut_ptr() as *mut i64;
+            unsafe {
+                *buf_ptr = msg_type;
+            }
+        } else {
+            self.buf.clear();
+            self.buf.write(&msg_type.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn append(&mut self, val: u8) {
+        self.buf.push(val)
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.buf.as_ptr()
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buf.as_mut_ptr()
+    }
+    #[allow(dead_code)]
+    pub fn get_data_ptr(&self) -> *const u8 {
+        debug_assert!(self.buf.len() >= MSG_TYPE_FIELD_LEN);
+        unsafe { self.buf.as_ptr().add(MSG_TYPE_FIELD_LEN) }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_data_mut_ptr(&mut self) -> *mut u8 {
+        debug_assert!(self.buf.len() >= MSG_TYPE_FIELD_LEN);
+        unsafe { self.buf.as_mut_ptr().add(MSG_TYPE_FIELD_LEN) }
+    }
+
+    pub fn set_len(&mut self, new_len: usize) {
+        unsafe { self.buf.set_len(new_len + MSG_TYPE_FIELD_LEN) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len() - MSG_TYPE_FIELD_LEN
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity() - MSG_TYPE_FIELD_LEN
+    }
+}
+
+impl Index<usize> for Message {
+    type Output = u8;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.buf.index(index + MSG_TYPE_FIELD_LEN)
+    }
+}
+impl Index<Range<usize>> for Message {
+    type Output = [u8];
+    fn index(&self, index: Range<usize>) -> &Self::Output {
+        self.buf
+            .index(index.start + MSG_TYPE_FIELD_LEN..index.end + MSG_TYPE_FIELD_LEN)
+    }
+}
+
+impl io::Write for Message {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.buf.len() + buf.len() > self.buf.capacity() {
+            return Err(io::Error::new(
+                ErrorKind::OutOfMemory,
+                "exceed the buffer capacity",
+            ));
+        }
+        unsafe {
+            let ptr = self.buf.as_mut_ptr().add(self.buf.len());
+            buf.as_ptr().copy_to(ptr, buf.len());
+            self.buf.set_len(self.buf.len() + buf.len());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -260,21 +361,14 @@ where
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let mut buffer: Vec<u8> = Vec::with_capacity(self.max_size);
-        let mtype: i64 = mtype.into();
-        buffer.extend(mtype.to_le_bytes());
-        if let Err(_) = serde_cbor::ser::to_writer(&mut buffer, &src) {
-             return Err(IpcError::FailedToSerialize);
+        let mut buffer = Message::with_capacity(self.max_size);
+        buffer.set_msg_type(mtype.into());
+        if let Err(_) = serde_json::ser::to_writer(&mut buffer, &src) {
+            return Err(IpcError::FailedToSerialize);
         }
+        // buffer.append(0);
 
-        let res = unsafe {
-            msgsnd(
-                self.id,
-                buffer.as_ptr(),
-                buffer.len() - MSG_TYPE_FIELD_LEN,
-                0,
-            )
-        };
+        let res = unsafe { msgsnd(self.id, buffer.as_ptr(), buffer.len(), 0) };
 
         match res {
             -1 => Err(Errno::from_i32(errno()).into()),
@@ -306,16 +400,10 @@ where
             return Err(IpcError::QueueIsUninitialized);
         }
 
-        let mut buffer = Vec::with_capacity(self.max_size);
+        let mut buffer = Message::with_capacity(self.max_size);
 
         let size = unsafe {
-            let size = msgrcv(
-                self.id,
-                buffer.as_mut_ptr(),
-                self.max_size,
-                0,
-                msg_flag,
-            );
+            let size = msgrcv(self.id, buffer.as_mut_ptr(), buffer.capacity(), 0, msg_flag);
             if size >= 0 {
                 buffer.set_len(size as usize);
             }
@@ -323,9 +411,7 @@ where
         };
 
         if size >= 0 {
-            match serde_cbor::from_slice(
-                &buffer[MSG_TYPE_FIELD_LEN..MSG_TYPE_FIELD_LEN + size as usize],
-            ) {
+            match serde_json::from_slice(&buffer[0..size as usize]) {
                 Ok(r) => Ok(r),
                 Err(_) => Err(IpcError::FailedToDeserialize),
             }
@@ -337,12 +423,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use libc::ftok;
+    // use crate::linux::ftok;
     use IpcError;
     use MessageQueue;
 
     #[test]
     fn send_message() {
-        let queue = MessageQueue::new(1234, 128).init().unwrap();
+        let queue = MessageQueue::new(1234, 128).create().init().unwrap();
         let res = queue.send("kalinka", 25);
         println!("{:?}", res);
         assert!(res.is_ok());
@@ -365,5 +453,93 @@ mod tests {
 
         println!("{}", queue.mask);
         assert_eq!(Err(IpcError::NoMessage), queue.recv())
+    }
+
+    use serde::{Deserialize, Serialize};
+    #[derive(Serialize, Deserialize)]
+    struct MyString {
+        text: String,
+    }
+
+    #[test]
+    fn test_with_cpp() {
+        const MSG_FILE: &str = "/etc/passwd\0";
+        let key = unsafe { ftok(MSG_FILE.as_ptr() as *const i8, 'z' as u8 as i32) };
+        println!("the key: {key}");
+        if key < 0 {
+            eprintln!("ftok error");
+            return;
+        }
+        let queue = MessageQueue::new(key, 128).init().unwrap();
+
+        let msg = MyString {
+            text: "hello 123".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "hahaha".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "lalal".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "nenen".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+    }
+    #[test]
+    fn test_self_send_recv() {
+        const MSG_FILE: &str = "/etc/passwd\0";
+        let key = unsafe { ftok(MSG_FILE.as_ptr() as *const i8, 'd' as u8 as i32) };
+        println!("the key: {key}");
+        if key < 0 {
+            eprintln!("ftok error");
+            return;
+        }
+        let queue = MessageQueue::new(key, 128).create().auto_kill(true).init().unwrap();
+
+        let msg = MyString {
+            text: "hello 123".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "hahaha".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "lalal".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
+
+        let msg = MyString {
+            text: "nenen".to_string(),
+        };
+        queue.send(msg, 3).unwrap();
+        let ret = queue.recv().unwrap();
+        println!("recv -{}-", ret.text);
     }
 }
